@@ -2,10 +2,9 @@ pipeline {
     agent any
 
     environment {
-        DOCKER_IMAGE = "purshath/kanban-dashboard"
-        CONTAINER_NAME = "kanban-app"
-        APP_PORT = "80"
+        DOCKER_IMAGE   = "purshath/kanban-dashboard"
         CONTAINER_PORT = "8080"
+        UPSTREAM_CONF  = "/etc/nginx/conf.d/kanban-upstream.conf"
     }
 
     stages {
@@ -13,7 +12,7 @@ pipeline {
             steps {
                 checkout scm
                 script {
-                    env.GIT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.GIT_SHA   = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
                     env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_SHA}"
                     echo "Building version: ${env.DOCKER_IMAGE}:${env.IMAGE_TAG}"
                 }
@@ -42,36 +41,41 @@ pipeline {
             }
         }
 
-        stage('Deploy to EC2') {
+        stage('Deploy Inactive Slot (Blue/Green)') {
             steps {
+                script {
+                    def blueRunning = sh(script: "docker ps -q -f name=^kanban-blue\$", returnStdout: true).trim()
+                    if (blueRunning) {
+                        env.TARGET_NAME = "kanban-green"
+                        env.TARGET_PORT = "8082"
+                        env.OLD_NAME    = "kanban-blue"
+                    } else {
+                        env.TARGET_NAME = "kanban-blue"
+                        env.TARGET_PORT = "8081"
+                        env.OLD_NAME    = "kanban-green"
+                    }
+                    echo "Deploying ${env.DOCKER_IMAGE}:${env.IMAGE_TAG} to ${env.TARGET_NAME} on port ${env.TARGET_PORT} (live: ${env.OLD_NAME})"
+                }
+
                 sh '''
-                    # Save current working image for rollback if it exists
-                    docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} > /tmp/prev_image.txt 2>/dev/null || true
-
-                    # Stop and remove existing container
-                    docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
-
-                    # Run new container with resource limits
+                    docker rm -f ${TARGET_NAME} 2>/dev/null || true
                     docker run -d \
-                        --name ${CONTAINER_NAME} \
+                        --name ${TARGET_NAME} \
                         --restart unless-stopped \
                         --memory="512m" \
                         --cpus="0.5" \
-                        -p ${APP_PORT}:${CONTAINER_PORT} \
+                        -p 127.0.0.1:${TARGET_PORT}:${CONTAINER_PORT} \
                         ${DOCKER_IMAGE}:${IMAGE_TAG}
                 '''
             }
         }
 
-        stage('Health Check & Validation') {
+        stage('Health Check Inactive Slot') {
             steps {
                 sh '''
-                    echo "Checking container is running..."
-                    docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running"
-
-                    echo "Waiting for Docker HEALTHCHECK to report healthy..."
+                    echo "Waiting for ${TARGET_NAME} on port ${TARGET_PORT} to become healthy..."
                     for i in $(seq 1 12); do
-                        STATUS=$(docker inspect --format='{{.State.Health.Status}}' ${CONTAINER_NAME} 2>/dev/null || echo "starting")
+                        STATUS=$(docker inspect --format='{{.State.Health.Status}}' ${TARGET_NAME} 2>/dev/null || echo "starting")
                         echo "Attempt $i: Health status = $STATUS"
                         if [ "$STATUS" = "healthy" ]; then
                             break
@@ -80,12 +84,27 @@ pipeline {
                     done
 
                     if [ "$STATUS" != "healthy" ]; then
-                        echo "ERROR: Container failed health check (status: $STATUS)"
+                        echo "ERROR: ${TARGET_NAME} failed health check (status: $STATUS)"
                         exit 1
                     fi
 
-                    echo "Verifying HTTP response with curl..."
-                    curl -f -I http://127.0.0.1:${APP_PORT}
+                    curl -f -I http://127.0.0.1:${TARGET_PORT}
+                '''
+            }
+        }
+
+        stage('Switch Traffic & Clean Up') {
+            steps {
+                sh '''
+                    echo "upstream kanban_backend { server 127.0.0.1:${TARGET_PORT}; }" > ${UPSTREAM_CONF}
+                    sudo /usr/sbin/nginx -t
+                    sudo /usr/sbin/nginx -s reload
+
+                    echo "Traffic switched to ${TARGET_NAME} (${TARGET_PORT}). Verifying live port 80..."
+                    curl -f -I http://127.0.0.1:80
+
+                    echo "Removing old container: ${OLD_NAME}"
+                    docker rm -f ${OLD_NAME} 2>/dev/null || true
                 '''
             }
         }
@@ -93,24 +112,13 @@ pipeline {
 
     post {
         success {
-            echo "Deployment succeeded for ${DOCKER_IMAGE}:${env.IMAGE_TAG}!"
+            echo "Zero-downtime deployment succeeded! Live container: ${env.TARGET_NAME} (${DOCKER_IMAGE}:${env.IMAGE_TAG})"
         }
         failure {
-            echo "Deployment failed! Triggering rollback..."
+            echo "Deployment failed! Live traffic on ${env.OLD_NAME} was never interrupted. Cleaning up failed slot ${env.TARGET_NAME}..."
             sh '''
-                if [ -s /tmp/prev_image.txt ]; then
-                    PREV_IMAGE=$(cat /tmp/prev_image.txt)
-                    echo "Rolling back to previous working image: $PREV_IMAGE"
-                    docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
-                    docker run -d \
-                        --name ${CONTAINER_NAME} \
-                        --restart unless-stopped \
-                        --memory="512m" \
-                        --cpus="0.5" \
-                        -p ${APP_PORT}:${CONTAINER_PORT} \
-                        "$PREV_IMAGE"
-                else
-                    echo "No previous image found to roll back to."
+                if [ -n "${TARGET_NAME}" ]; then
+                    docker rm -f ${TARGET_NAME} 2>/dev/null || true
                 fi
             '''
         }
